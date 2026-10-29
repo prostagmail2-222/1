@@ -60,7 +60,7 @@ load_dotenv()
 
 # You may put your values here, but environment variables / .env take priority.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_BOT_TOKEN_HERE").strip()
-OWNER_IDS_RAW = os.getenv("OWNER_IDS", "").strip()
+OWNER_IDS_RAW = os.getenv("OWNER_IDS", "8318241400").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./anime_bot.db").strip()
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 BOT_NAME = os.getenv("BOT_NAME", "Anime Bot").strip()
