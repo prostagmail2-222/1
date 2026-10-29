@@ -1,0 +1,21 @@
+# Anime Telegram bot - Render Environment Variables
+# Replace the placeholders before deploying.
+
+BOT_TOKEN=PUT_BOT_TOKEN_HERE
+OWNER_IDS=123456789
+
+# Easiest for a first test. For production, use Render PostgreSQL (see note below).
+DATABASE_URL=sqlite+aiosqlite:///./anime_bot.db
+
+# Optional. Leave empty if you are not using Redis.
+REDIS_URL=
+
+BOT_NAME=Anime Bot
+PAYMENT_INSTRUCTIONS="VIP to'lovi bo'yicha bot egasi bilan bog'laning."
+
+# off | openai | gemini
+AI_PROVIDER=off
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
