@@ -804,6 +804,32 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def add_episode_auto(self, anime_id: int, anime_code: str, file_id: str,
+                               file_type: str, file_size: str, is_vip: int) -> int:
+        """Keyingi bo'sh qism raqamini avtomatik beradi (parallel yuborilganda ham xavfsiz)."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT COALESCE(MAX(episode_number), 0) + 1 FROM episodes WHERE anime_id = ?",
+                (anime_id,)
+            )
+            ep_num = (await cur.fetchone())[0]
+            await conn.execute("""
+                INSERT INTO episodes (
+                    anime_id, anime_code, episode_number, episode_title,
+                    file_id, file_type, file_size, is_vip
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (anime_id, str(anime_code), ep_num, f"{ep_num}-qism",
+                  file_id, file_type, file_size, int(is_vip)))
+            await conn.execute("""
+                UPDATE animes
+                SET total_episodes = (SELECT COUNT(*) FROM episodes WHERE anime_id = ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (anime_id, anime_id))
+            await conn.commit()
+            return ep_num
+
     async def get_episodes(self, anime_id: int) -> List[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -1048,6 +1074,9 @@ class AntiSpamMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event: Union[Message, CallbackQuery], data: Dict[str, Any]):
         user = data.get("event_from_user")
+        # Ketma-ket yuborilgan video/hujjatlar (qism yuklash) tashlab yuborilmasin
+        if isinstance(event, Message) and (event.video or event.document):
+            return await handler(event, data)
         if user:
             now = time.time()
             last_time = self.users_timestamps.get(user.id, 0)
@@ -1104,6 +1133,7 @@ class EpisodeUploadStates(StatesGroup):
     waiting_for_video_file = State()
     waiting_for_is_vip = State()
     confirm_episode = State()
+    bulk_upload = State()
 
 
 class AnimeEditStates(StatesGroup):
@@ -2704,14 +2734,48 @@ async def process_upload_vip_and_save(message: Message, state: FSMContext):
         reply_markup=Keyboards.get_main_menu(user.get("role", "admin"), user.get("current_mode", "admin"))
     )
 
+    saved = await db.get_anime_by_code(data["code"], count_view=False)
+    if saved:
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="🎬 Qismlarni qo'shish", callback_data=f"bulk_eps_{saved['id']}"))
+        await message.answer(
+            "Qismlarni hoziroq yuklashni boshlaysizmi? Kod qayta kiritilmaydi, "
+            "qism raqamlari avtomatik (1, 2, 3...) beriladi.",
+            reply_markup=kb.as_markup()
+        )
+
+
+async def begin_bulk_upload(target: Message, state: FSMContext, anime: Dict[str, Any]):
+    """Anime kodini bir marta saqlab, ketma-ket qism yuklash rejimini boshlaydi."""
+    last = len(await db.get_episodes(anime["id"]))
+    await state.set_state(EpisodeUploadStates.bulk_upload)
+    await state.update_data(
+        anime_id=anime["id"],
+        anime_code=anime["code"],
+        anime_title=anime["title"],
+        added_count=0,
+    )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✅ Tugatish", callback_data="bulk_eps_finish"))
+    await target.answer(
+        f"🎬 <b>{html.escape(anime['title'])}</b> (Kod: <code>{html.escape(anime['code'])}</code>)\n"
+        f"Hozirgi qismlar soni: <b>{last}</b> ta\n\n"
+        f"📹 Endi videolarni ketma-ket yuboring. Har bir video avtomatik keyingi qism "
+        f"(<b>{last + 1}-qism</b>dan boshlab) sifatida qo'shiladi.\n"
+        f"<i>Qism raqamini yozish shart emas. Bir nechta videoni birdan ham yuborishingiz mumkin. "
+        f"Tugagach «✅ Tugatish» tugmasini bosing.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb.as_markup()
+    )
+
 
 @admin_router.callback_query(F.data == "admin_add_episode")
 async def start_add_episode(callback: CallbackQuery, state: FSMContext):
     await state.set_state(EpisodeUploadStates.waiting_for_anime_code)
     text = (
-        "🎬 <b>Animega yangi qism (epizod) yuklash</b>\n\n"
-        "Qaysi animening kodi bo'yicha qism qo'shmoqchisiz?\n"
-        "Anime kodini kiriting (Masalan: <code>101</code>):"
+        "🎬 <b>Animega yangi qismlar yuklash</b>\n\n"
+        "Anime kodini bir marta kiriting (Masalan: <code>101</code>), "
+        "keyin videolarni ketma-ket yuborasiz:"
     )
     await callback.message.answer(text=text, parse_mode=ParseMode.HTML, reply_markup=Keyboards.get_cancel_markup())
     await callback.answer()
@@ -2725,97 +2789,82 @@ async def process_ep_code(message: Message, state: FSMContext):
     code = message.text.strip().replace("#", "")
     anime = await db.get_anime_by_code(code, count_view=False)
     if not anime:
-        await message.answer(f"❌ <b>'{html.escape(code)}' kodli anime bazadan topilmadi!</b>\nIltimos, qaytadan kiriting:")
+        await message.answer(
+            f"❌ <b>'{html.escape(code)}' kodli anime bazadan topilmadi!</b>\nIltimos, qaytadan kiriting:",
+            parse_mode=ParseMode.HTML
+        )
         return
-
-    await state.update_data(anime_id=anime["id"], anime_code=anime["code"], anime_title=anime["title"])
-    await state.set_state(EpisodeUploadStates.waiting_for_episode_num)
-    await message.answer(
-        f"🎬 Anime: <b>{html.escape(anime['title'])}</b>\n\n"
-        f"Endi <b>Qism raqami</b>ni kiriting (Masalan: <code>1</code>, <code>2</code>, <code>12</code>):",
-        parse_mode=ParseMode.HTML
-    )
+    await begin_bulk_upload(message, state, anime)
 
 
-@admin_router.message(EpisodeUploadStates.waiting_for_episode_num)
-async def process_ep_num(message: Message, state: FSMContext):
-    if not message.text or not message.text.strip():
-        await message.answer("Iltimos, bu bosqichda matn yuboring. Bekor qilish: /cancel")
+@admin_router.callback_query(F.data.startswith("bulk_eps_") & (F.data != "bulk_eps_finish"))
+async def cb_bulk_start(callback: CallbackQuery, state: FSMContext):
+    anime_id = int(callback.data.replace("bulk_eps_", ""))
+    anime = await db.get_anime_by_id(anime_id)
+    if not anime:
+        await callback.answer("Anime topilmadi!", show_alert=True)
         return
-    try:
-        ep_num = int(message.text.strip())
-        if ep_num <= 0:
-            raise ValueError("Qism raqami musbat bo'lishi kerak")
-    except ValueError:
-        await message.answer("Iltimos, faqat musbat raqam kiriting (masalan: 1):")
-        return
-
-    await state.update_data(episode_number=ep_num)
-    await state.set_state(EpisodeUploadStates.waiting_for_video_file)
-    await message.answer(
-        f"📹 <b>{ep_num}-qism video faylini yuboring:</b>\n"
-        f"<i>Telegram video yoki hujjat (document) formatida to'g'ridan-to'g'ri yuboring.</i>",
-        parse_mode=ParseMode.HTML
-    )
+    await callback.answer()
+    await begin_bulk_upload(callback.message, state, anime)
 
 
-@admin_router.message(EpisodeUploadStates.waiting_for_video_file, F.video | F.document)
-async def process_ep_file(message: Message, state: FSMContext):
+@admin_router.message(EpisodeUploadStates.bulk_upload, F.video | F.document)
+async def process_bulk_episode(message: Message, state: FSMContext):
     if message.video:
-        file_id = message.video.file_id
-        file_type = "video"
-        file_size = f"{round(message.video.file_size / (1024 * 1024), 1)} MB" if message.video.file_size else "Noma'lum"
-    elif message.document:
-        file_id = message.document.file_id
-        file_type = "document"
-        file_size = f"{round(message.document.file_size / (1024 * 1024), 1)} MB" if message.document.file_size else "Noma'lum"
+        file_id, file_type, size = message.video.file_id, "video", message.video.file_size
     else:
-        await message.answer("Iltimos, faqat video yoki hujjat yuboring!")
-        return
+        file_id, file_type, size = message.document.file_id, "document", message.document.file_size
+    file_size = f"{round(size / (1024 * 1024), 1)} MB" if size else "Noma'lum"
 
     data = await state.get_data()
-    await state.update_data(
+    anime = await db.get_anime_by_id(data["anime_id"])
+    if not anime:
+        await state.clear()
+        await message.answer("❌ Anime topilmadi (o'chirilgan bo'lishi mumkin). Jarayon to'xtatildi.")
+        return
+
+    # Anime VIP bo'lsa, qismlar ham VIP bo'ladi; aks holda bepul
+    ep_num = await db.add_episode_auto(
+        anime_id=anime["id"],
+        anime_code=anime["code"],
         file_id=file_id,
         file_type=file_type,
         file_size=file_size,
+        is_vip=int(anime.get("is_vip") or 0),
     )
-    await state.set_state(EpisodeUploadStates.waiting_for_is_vip)
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="🆓 Bepul"), KeyboardButton(text="💎 Faqat VIP"))
-    await message.answer(
-        f"📹 Fayl qabul qilindi ({file_size}).\nUshbu qism <b>Bepul</b> bo'lsinmi yoki <b>Faqat VIP</b>?",
+    cur = await state.get_data()
+    await state.update_data(added_count=int(cur.get("added_count", 0)) + 1)
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✅ Tugatish", callback_data="bulk_eps_finish"))
+    await message.reply(
+        f"✅ <b>{ep_num}-qism</b> qo'shildi ({file_size}).\n📹 Keyingi videoni yuboring yoki tugating.",
         parse_mode=ParseMode.HTML,
-        reply_markup=builder.as_markup(resize_keyboard=True),
+        reply_markup=kb.as_markup()
     )
 
 
-@admin_router.message(EpisodeUploadStates.waiting_for_is_vip)
-async def process_ep_vip(message: Message, state: FSMContext):
-    if not message.text or not message.text.strip():
-        await message.answer("Iltimos, bu bosqichda matn yuboring. Bekor qilish: /cancel")
-        return
-    data = await state.get_data()
-    is_vip = 1 if "VIP" in (message.text or "") else 0
-    ep_data = {
-        "anime_id": data["anime_id"],
-        "anime_code": data["anime_code"],
-        "episode_number": data["episode_number"],
-        "episode_title": f"{data['episode_number']}-qism",
-        "file_id": data["file_id"],
-        "file_type": data["file_type"],
-        "file_size": data["file_size"],
-        "is_vip": is_vip,
-    }
-    await db.add_episode(ep_data)
-    await state.clear()
-
-    user = await db.get_user(message.from_user.id) or {}
+@admin_router.message(EpisodeUploadStates.bulk_upload)
+async def bulk_wrong_type(message: Message):
     await message.answer(
-        f"🎉 <b>Qism muvaffaqiyatli yuklandi!</b>\n\n"
-        f"🎬 <b>Anime:</b> {html.escape(data['anime_title'])}\n"
-        f"▶️ <b>Qism:</b> {data['episode_number']}-qism\n"
-        f"💾 <b>Hajmi:</b> {data['file_size']}\n\n"
-        f"Foydalanuvchilar darhol ushbu qismni tomosha qilishlari mumkin!",
+        "📹 Iltimos, <b>video yoki hujjat (fayl)</b> yuboring. Tugatish uchun «✅ Tugatish» tugmasini bosing "
+        "yoki /cancel yozing.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@admin_router.callback_query(F.data == "bulk_eps_finish")
+async def cb_bulk_finish(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    added = int(data.get("added_count", 0))
+    title = data.get("anime_title", "")
+    await state.clear()
+    await callback.answer()
+    user = await db.get_user(callback.from_user.id) or {}
+    await callback.message.answer(
+        f"🎉 <b>Yuklash yakunlandi!</b>\n\n"
+        f"🎬 <b>Anime:</b> {html.escape(title)}\n"
+        f"➕ <b>Qo'shilgan qismlar:</b> {added} ta",
         parse_mode=ParseMode.HTML,
         reply_markup=Keyboards.get_main_menu(user.get("role", "admin"), user.get("current_mode", "admin"))
     )
